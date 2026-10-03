@@ -3,13 +3,29 @@
 const DB = 'handsketch';
 const STORE = 'kv';
 
+let conn: Promise<IDBDatabase> | null = null;
+
+/** One shared connection; reopened if the browser closes it. */
 function open(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+  if (!conn) {
+    conn = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+      req.onsuccess = () => {
+        req.result.onclose = () => (conn = null);
+        req.result.onversionchange = () => {
+          req.result.close();
+          conn = null;
+        };
+        resolve(req.result);
+      };
+      req.onerror = () => {
+        conn = null;
+        reject(req.error);
+      };
+    });
+  }
+  return conn;
 }
 
 export async function kvGet<T>(key: string): Promise<T | undefined> {
@@ -25,7 +41,8 @@ export async function kvGet<T>(key: string): Promise<T | undefined> {
   }
 }
 
-export async function kvSet(key: string, value: unknown): Promise<void> {
+/** Resolves true when the value was durably written (false on quota/blocked storage). */
+export async function kvSet(key: string, value: unknown): Promise<boolean> {
   try {
     const db = await open();
     await new Promise<void>((resolve, reject) => {
@@ -33,9 +50,11 @@ export async function kvSet(key: string, value: unknown): Promise<void> {
       tx.objectStore(STORE).put(value, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
+    return true;
   } catch {
-    /* ignore */
+    return false;
   }
 }
 

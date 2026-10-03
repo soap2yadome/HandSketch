@@ -13,8 +13,10 @@ export type CanvasFactory = (width: number, height: number) => RasterCanvas;
 
 export const hasInk = (page: Page) => page.elements.length > 0;
 
-export function overlayScale(page: Page): number {
-  return Math.max(1.5, Math.min(3, 3000 / Math.max(page.width, page.height)));
+/** Raster resolution for a page: up to 3x, but never more than ~40 megapixels (browser canvas limits). */
+export function overlayScale(page: Page, max = 3): number {
+  const byArea = Math.sqrt(40_000_000 / (page.width * page.height));
+  return Math.max(0.25, Math.min(max, byArea));
 }
 
 /** Rasterise a page's annotations. `background` paints under the ink (blank pages). */
@@ -35,22 +37,37 @@ export function pageToSvg(page: Page, background = '#ffffff'): string {
   return primsToSvg(renderPage(page), page.width, page.height, background);
 }
 
-const norm = (deg: number) => ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
+/** pdf.js ignores /Rotate values that aren't multiples of 90; do the same so both agree. */
+const norm = (deg: number) => (deg % 90 === 0 ? ((deg % 360) + 360) % 360 : 0);
+
+/** The visible box: CropBox clipped to the MediaBox, as pdf.js computes it. */
+function visibleBox(page: PDFPage): { x: number; y: number; width: number; height: number } {
+  const m = page.getMediaBox();
+  const c = page.getCropBox();
+  const x0 = Math.max(Math.min(c.x, c.x + c.width), Math.min(m.x, m.x + m.width));
+  const y0 = Math.max(Math.min(c.y, c.y + c.height), Math.min(m.y, m.y + m.height));
+  const x1 = Math.min(Math.max(c.x, c.x + c.width), Math.max(m.x, m.x + m.width));
+  const y1 = Math.min(Math.max(c.y, c.y + c.height), Math.max(m.y, m.y + m.height));
+  if (x1 - x0 < 1 || y1 - y0 < 1) return { x: m.x, y: m.y, width: Math.abs(m.width), height: Math.abs(m.height) };
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
 
 /** Draw an overlay PNG covering the page's visible (rotated, cropped) area. */
 async function placeOverlay(out: PDFDocument, page: PDFPage, png: Uint8Array): Promise<void> {
   const img = await out.embedPng(png);
-  const { x, y, width: w, height: h } = page.getCropBox();
+  const { x, y, width: w, height: h } = visibleBox(page);
   const rot = norm(page.getRotation().angle);
+  // Wrap the original content in q/Q so a page that leaves a modified graphics state can't skew our overlay.
+  page.translateContent(0, 0);
   const vw = rot === 90 || rot === 270 ? h : w;
   const vh = rot === 90 || rot === 270 ? w : h;
   const anchor = rot === 0 ? { x, y } : rot === 90 ? { x: x + w, y } : rot === 180 ? { x: x + w, y: y + h } : { x, y: y + h };
   page.drawImage(img, { x: anchor.x, y: anchor.y, width: vw, height: vh, rotate: degrees(rot) });
 }
 
-/** Visual (rotation-applied) size of a PDF page in points, matching pdf.js `getViewport({scale:1})`. */
+/** Visual (rotation-applied) size of a PDF page in default user units. */
 export function visualSize(page: PDFPage): { width: number; height: number } {
-  const { width, height } = page.getCropBox();
+  const { width, height } = visibleBox(page);
   const rot = norm(page.getRotation().angle);
   return rot === 90 || rot === 270 ? { width: height, height: width } : { width, height };
 }
@@ -62,10 +79,26 @@ export interface ExportInput {
   make: CanvasFactory;
 }
 
+export class ExportError extends Error {}
+
 /** Build the annotated PDF. Preserves the original file in place when pages are untouched. */
 export async function exportPdf({ doc, pdfBytes, make }: ExportInput): Promise<Uint8Array> {
-  const src = pdfBytes ? await PDFDocument.load(pdfBytes, { ignoreEncryption: true }) : undefined;
-  const pdfPages = doc.pages.filter((p) => p.kind === 'pdf');
+  let src: PDFDocument | undefined;
+  if (pdfBytes) {
+    try {
+      src = await PDFDocument.load(pdfBytes);
+    } catch (e) {
+      if (/encrypt/i.test((e as Error).message)) {
+        throw new ExportError('This PDF is password-protected/encrypted, so it can\'t be re-saved with markup. Remove the protection (print to a new PDF) and reopen it.');
+      }
+      throw new ExportError(`The original PDF could not be processed for export: ${(e as Error).message}`);
+    }
+  }
+  for (const p of doc.pages) {
+    if (p.kind === 'pdf' && (!src || p.pdfIndex === undefined || p.pdfIndex < 0 || p.pdfIndex >= src.getPageCount())) {
+      throw new ExportError('A page refers to a PDF page that is not available (was the project saved without its PDF?).');
+    }
+  }
   const untouched =
     !!src && doc.pages.length === src.getPageCount() && doc.pages.every((p, i) => p.kind === 'pdf' && p.pdfIndex === i);
 
@@ -79,10 +112,13 @@ export async function exportPdf({ doc, pdfBytes, make }: ExportInput): Promise<U
     }
   } else {
     out = await PDFDocument.create();
+    // One copy call keeps fonts/images shared between pages instead of duplicating them per page.
+    const wanted = doc.pages.filter((p) => p.kind === 'pdf').map((p) => p.pdfIndex!);
+    const copied = src && wanted.length ? await out.copyPages(src, wanted) : [];
+    let next = 0;
     for (const p of doc.pages) {
-      if (p.kind === 'pdf' && src && p.pdfIndex !== undefined) {
-        const [copied] = await out.copyPages(src, [p.pdfIndex]);
-        const page = out.addPage(copied);
+      if (p.kind === 'pdf') {
+        const page = out.addPage(copied[next++]);
         if (hasInk(p)) await placeOverlay(out, page, await rasterizePage(p, make));
       } else {
         const page = out.addPage([p.width, p.height]);
@@ -92,7 +128,6 @@ export async function exportPdf({ doc, pdfBytes, make }: ExportInput): Promise<U
       }
     }
   }
-  void pdfPages;
   out.setProducer('HandSketch');
   out.setCreator('HandSketch');
   return out.save();

@@ -231,3 +231,91 @@ test('stays responsive with a few hundred shapes', async ({ page }) => {
   });
   expect(t).toBeLessThan(4000);
 });
+
+test('deleting a symbol leaves its connector where it was drawn', async ({ page }) => {
+  await page.click('#btn-new');
+  await page.locator('.sym[data-symbol="router"]').click();
+  await click(page, 200, 200);
+  await page.locator('.sym[data-symbol="switch"]').click();
+  await click(page, 500, 200);
+  await page.keyboard.press('Escape');
+  const [a, b] = (await els(page)).filter((x) => x.type === 'symbol');
+  await page.keyboard.press('l');
+  await dragTo(page, a.x + a.size * (44 / 48), a.y + a.size / 2, b.x + b.size * (4 / 48), b.y + b.size / 2);
+  // move the target a bit first, so the connector's stored p2 is stale
+  await page.keyboard.press('v');
+  await dragTo(page, b.x + b.size / 2, b.y + b.size / 2, b.x + b.size / 2, b.y + b.size / 2 + 90);
+  const moved = (await els(page)).find((x) => x.id === b.id)!;
+  await click(page, moved.x + moved.size / 2, moved.y + moved.size / 2);
+  await page.keyboard.press('Delete');
+  const wire = (await els(page)).find((x) => x.type === 'line')!;
+  expect(wire.to).toBeUndefined();
+  // frozen at the symbol's last port position (y was shifted by ~90), not its creation point
+  expect(wire.p2.y).toBeGreaterThan(b.y + b.size / 2 + 60);
+});
+
+test('Escape cancels a drag and restores the original position', async ({ page }) => {
+  await page.click('#btn-new');
+  await page.locator('.sym[data-symbol="server"]').click();
+  await click(page, 300, 300);
+  await page.keyboard.press('Escape');
+  const s0 = (await els(page)).find((x) => x.type === 'symbol')!;
+  const a = await at(page, s0.x + s0.size / 2, s0.y + s0.size / 2);
+  await page.mouse.move(a.x, a.y);
+  await page.mouse.down();
+  await page.mouse.move(a.x + 120, a.y + 60, { steps: 5 });
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  const s1 = (await els(page)).find((x) => x.type === 'symbol')!;
+  expect(s1.x).toBe(s0.x);
+  expect(s1.y).toBe(s0.y);
+  await expect(page.locator('#btn-undo')).toBeEnabled(); // placement is still undoable...
+  await page.keyboard.press('Control+z');
+  expect(await els(page)).toHaveLength(0); // ...and the cancelled drag added no extra undo step
+});
+
+test('rejects a malformed project file without touching the open document', async ({ page }) => {
+  await page.click('#btn-new');
+  await page.locator('.sym[data-symbol="router"]').click();
+  await click(page, 300, 300);
+  const evil = JSON.stringify({
+    app: 'handsketch', version: 1,
+    doc: { pages: [{ id: 'p', kind: 'blank', width: 600, height: 400, elements: [{ id: 'c', seed: 1, type: 'cloud', x: 0, y: 0, w: 1e9, h: 1e9, style: { stroke: '#000', fill: '#fff', fillStyle: 'hachure', width: 2, roughness: 1 } }] }] },
+  });
+  await page.setInputFiles('#file-project', { name: 'evil.json', mimeType: 'application/json', buffer: Buffer.from(evil) });
+  await expect(page.locator('#status')).toContainText('invalid page');
+  expect((await els(page)).filter((x) => x.type === 'symbol')).toHaveLength(1);
+});
+
+test('restores a PDF session (including the PDF itself) after reload', async ({ page }) => {
+  await page.setInputFiles('#file-pdf', { name: 'plans.pdf', mimeType: 'application/pdf', buffer: await fixturePdf() });
+  await expect(page.locator('#pdf-canvas')).toHaveAttribute('data-rendered', '0');
+  await page.keyboard.press('r');
+  await dragTo(page, 100, 100, 300, 200);
+  await page.waitForTimeout(1200);
+  await page.reload();
+  await expect(page.locator('#status')).toContainText('Restored');
+  await expect(page.locator('#pg-label')).toHaveText('Page 1 / 3');
+  await expect(page.locator('#pdf-canvas')).toHaveAttribute('data-rendered', '0');
+  expect((await els(page)).filter((x) => x.type === 'rect')).toHaveLength(1);
+});
+
+test('a style slider drag is a single undo step', async ({ page }) => {
+  await page.click('#btn-new');
+  await page.locator('.sym[data-symbol="router"]').click();
+  await click(page, 300, 300);
+  await page.keyboard.press('v');
+  const s = (await els(page)).find((x) => x.type === 'symbol')!;
+  await click(page, s.x + s.size / 2, s.y + s.size / 2);
+  await page.evaluate(() => {
+    const input = document.getElementById('st-width') as HTMLInputElement;
+    for (const v of [3, 4, 5, 6, 7]) {
+      input.value = String(v);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  expect((await els(page)).find((x) => x.type === 'symbol')!.style.width).toBe(7);
+  await page.keyboard.press('Control+z');
+  expect((await els(page)).find((x) => x.type === 'symbol')!.style.width).toBe(2);
+});

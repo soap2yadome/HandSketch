@@ -1,4 +1,4 @@
-import type { Doc, El, Page } from './model';
+import { newId, type Doc, type El, type Page } from './model';
 
 export interface ProjectFile {
   app: 'handsketch';
@@ -27,18 +27,65 @@ export function serializeProject(doc: Doc, pdfBytes?: Uint8Array): string {
   return JSON.stringify(file);
 }
 
-const ELEMENT_TYPES = new Set(['line', 'arrow', 'rect', 'ellipse', 'highlight', 'cloud', 'free', 'text', 'symbol', 'stamp']);
+const MAX_PAGES = 2000;
+const MAX_ELEMENTS = 20_000;
+const MAX_POINTS = 50_000;
+const MAX_COORD = 1e5;
+const MAX_PAGE = 20_000;
+const MAX_TEXT = 5_000;
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+const num = (v: unknown, lim = MAX_COORD): v is number => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= lim;
+const str = (v: unknown, max = MAX_TEXT): v is string => typeof v === 'string' && v.length <= max;
+const pt = (v: unknown): boolean => isObj(v) && num(v.x) && num(v.y);
+const link = (v: unknown): boolean => v === undefined || (isObj(v) && str(v.id, 100) && Number.isInteger(v.port) && (v.port as number) >= 0 && (v.port as number) < 64);
+
+function validStyle(v: unknown): boolean {
+  return (
+    isObj(v) &&
+    str(v.stroke, 40) && str(v.fill, 40) &&
+    (v.fillStyle === 'none' || v.fillStyle === 'hachure' || v.fillStyle === 'solid') &&
+    num(v.width, 100) && (v.width as number) > 0 &&
+    num(v.roughness, 20) && (v.roughness as number) >= 0
+  );
+}
+
+function validElement(e: unknown): e is El {
+  if (!isObj(e) || !str(e.id, 100) || !num(e.seed, 2 ** 32) || !validStyle(e.style)) return false;
+  switch (e.type) {
+    case 'line':
+    case 'arrow':
+      return pt(e.p1) && pt(e.p2) && (e.route === 'straight' || e.route === 'elbow') && link(e.from) && link(e.to) && (e.label === undefined || str(e.label));
+    case 'rect': case 'ellipse': case 'highlight': case 'cloud':
+      return num(e.x) && num(e.y) && num(e.w) && num(e.h);
+    case 'free':
+      return Array.isArray(e.pts) && e.pts.length <= MAX_POINTS && e.pts.every(pt);
+    case 'text':
+      return num(e.x) && num(e.y) && str(e.text) && num(e.size, 1000) && (e.size as number) > 0;
+    case 'symbol':
+      return str(e.symbol, 100) && num(e.x) && num(e.y) && num(e.size, 5000) && (e.size as number) > 0 && num(e.rot, 3600) && (e.label === undefined || str(e.label));
+    case 'stamp':
+      return num(e.x) && num(e.y) && str(e.text, 200) && num(e.size, 1000) && (e.size as number) > 0 && num(e.rot, 3600);
+    default:
+      return false;
+  }
+}
 
 function validPage(p: unknown): p is Page {
-  if (!p || typeof p !== 'object') return false;
-  const o = p as Partial<Page>;
-  return (
-    (o.kind === 'pdf' || o.kind === 'blank') &&
-    typeof o.width === 'number' && o.width > 0 &&
-    typeof o.height === 'number' && o.height > 0 &&
-    Array.isArray(o.elements) &&
-    o.elements.every((e) => !!e && typeof e === 'object' && ELEMENT_TYPES.has((e as El).type) && typeof (e as El).id === 'string')
-  );
+  if (!isObj(p)) return false;
+  if (p.kind !== 'pdf' && p.kind !== 'blank') return false;
+  if (!str(p.id, 100) || !num(p.width, MAX_PAGE) || !num(p.height, MAX_PAGE) || (p.width as number) <= 0 || (p.height as number) <= 0) return false;
+  if (p.kind === 'pdf' && !(Number.isInteger(p.pdfIndex) && (p.pdfIndex as number) >= 0)) return false;
+  return Array.isArray(p.elements) && p.elements.length <= MAX_ELEMENTS && p.elements.every(validElement);
+}
+
+/** Throws a user-readable error unless `doc` is structurally safe to render. Used for files and autosave. */
+export function validateDoc(doc: unknown): asserts doc is Doc {
+  if (!isObj(doc) || !Array.isArray(doc.pages) || !doc.pages.length) throw new Error('Not a HandSketch project file.');
+  if (doc.pages.length > MAX_PAGES) throw new Error('Project has too many pages.');
+  doc.pages.forEach((p, i) => {
+    if (!validPage(p)) throw new Error(`Project file contains an invalid page (page ${i + 1}).`);
+  });
 }
 
 export function parseProject(text: string): { doc: Doc; pdfBytes?: Uint8Array } {
@@ -48,10 +95,23 @@ export function parseProject(text: string): { doc: Doc; pdfBytes?: Uint8Array } 
   } catch {
     throw new Error('Not a HandSketch project file (invalid JSON).');
   }
-  const f = raw as Partial<ProjectFile>;
-  if (!f || f.app !== 'handsketch' || f.version !== 1 || !f.doc || !Array.isArray(f.doc.pages) || !f.doc.pages.length) {
-    throw new Error('Not a HandSketch project file.');
+  if (!isObj(raw) || raw.app !== 'handsketch' || raw.version !== 1) throw new Error('Not a HandSketch project file.');
+  validateDoc(raw.doc);
+  const doc = raw.doc as Doc;
+  if (raw.pdf !== undefined && typeof raw.pdf !== 'string') throw new Error('Project file has an invalid PDF payload.');
+  let pdfBytes: Uint8Array | undefined;
+  if (raw.pdf) {
+    try {
+      pdfBytes = base64ToBytes(raw.pdf as string);
+    } catch {
+      throw new Error('Project file has a corrupt embedded PDF.');
+    }
   }
-  if (!f.doc.pages.every(validPage)) throw new Error('Project file contains an invalid page.');
-  return { doc: f.doc, pdfBytes: f.pdf ? base64ToBytes(f.pdf) : undefined };
+  // Duplicate ids would alias selection/links; make them unique.
+  const seen = new Set<string>();
+  for (const p of doc.pages) {
+    if (seen.has(p.id)) p.id = newId('p');
+    seen.add(p.id);
+  }
+  return { doc, pdfBytes };
 }

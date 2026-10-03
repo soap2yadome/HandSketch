@@ -1,13 +1,13 @@
 import '@fontsource/caveat/500.css';
 import './styles.css';
-import { exportPdf, pageToSvg, rasterizePage, type CanvasFactory } from './export';
+import { ExportError, exportPdf, overlayScale, pageToSvg, rasterizePage, type CanvasFactory } from './export';
 import {
-  DEFAULT_STYLE, History, blankPage, cloneElements, cloneForPaste, moveElement, newId, newSeed, pruneLinks,
+  DEFAULT_STYLE, History, blankPage, cloneElements, cloneForPaste, moveElements, newId, newSeed, pruneLinks, removeElements,
   type BoxEl, type Doc, type El, type FillStyle, type LineEl, type Page, type StyleProps, type SymbolEl,
 } from './model';
 import { paintCanvas } from './paint';
 import { PdfSource } from './pdf';
-import { parseProject, serializeProject } from './project';
+import { parseProject, serializeProject, validateDoc } from './project';
 import { elementBounds, hitTest, lineEndpoints, renderElement, symbolPortPosition } from './render';
 import { dist, type Pt } from './sketch';
 import { kvDelete, kvGet, kvSet } from './store';
@@ -70,7 +70,7 @@ const S = {
   symQuery: '',
 };
 
-const histories = new Map<string, History>();
+let histories = new WeakMap<Page, History>();
 const stage = $('stage');
 const wrap = $('page-wrap');
 const pdfCanvas = $<HTMLCanvasElement>('pdf-canvas');
@@ -80,13 +80,18 @@ const statusEl = $('status');
 
 const page = (): Page => S.doc.pages[S.pageIdx];
 const hist = (): History => {
-  const id = page().id;
-  let h = histories.get(id);
-  if (!h) histories.set(id, (h = new History()));
+  const pg = page();
+  let h = histories.get(pg);
+  if (!h) histories.set(pg, (h = new History()));
   return h;
 };
 const selectedEls = () => page().elements.filter((e) => S.selection.includes(e.id));
 const dpr = () => Math.min(2, window.devicePixelRatio || 1);
+/** Backing-store pixels per page unit for the ink canvas, capped so huge pages can't exceed canvas limits. */
+const inkScale = (): number => {
+  const p = page();
+  return Math.min(S.zoom * dpr(), Math.sqrt(60_000_000 / (p.width * p.height)), 8192 / Math.max(p.width, p.height));
+};
 
 function say(msg: string): void {
   statusEl.textContent = msg;
@@ -108,7 +113,7 @@ let marquee: { a: Pt; b: Pt } | null = null;
 
 function drawInk(): void {
   const p = page();
-  const k = S.zoom * dpr();
+  const k = inkScale();
   inkCtx.setTransform(1, 0, 0, 1, 0, 0);
   inkCtx.clearRect(0, 0, ink.width, ink.height);
   inkCtx.setTransform(k, 0, 0, k, 0, 0);
@@ -213,9 +218,9 @@ function layout(): void {
   const h = Math.round(p.height * S.zoom);
   wrap.style.width = `${w}px`;
   wrap.style.height = `${h}px`;
-  const r = dpr();
-  const iw = Math.ceil(p.width * S.zoom * r);
-  const ih = Math.ceil(p.height * S.zoom * r);
+  const k = inkScale();
+  const iw = Math.ceil(p.width * k);
+  const ih = Math.ceil(p.height * k);
   if (ink.width !== iw || ink.height !== ih) {
     ink.width = iw;
     ink.height = ih;
@@ -263,7 +268,7 @@ function fitWidth(): void {
 
 function setZoom(z: number, anchor?: Pt): void {
   const old = S.zoom;
-  S.zoom = Math.max(0.2, Math.min(5, z));
+  S.zoom = Math.max(0.2, Math.min(5, z, 12000 / Math.max(page().width, page().height)));
   layout();
   if (anchor && old !== S.zoom) {
     stage.scrollLeft += anchor.x * (S.zoom - old);
@@ -356,13 +361,25 @@ type Drag =
   | { kind: 'pan'; sx: number; sy: number; left: number; top: number };
 let drag: Drag | null = null;
 let spaceDown = false;
-/** Pre-drag copy of the page; pushed to history only once the drag actually changes something. */
+/** Pre-drag copy of the page: pushed to history when the drag completes, restored if it is cancelled. */
 let pendingSnap: El[] | null = null;
+let activePointer: number | null = null;
 function markChanged(d: { moved: boolean }): void {
-  if (d.moved) return;
   d.moved = true;
-  if (pendingSnap) hist().push(pendingSnap);
+}
+
+/** Abort the current gesture, discarding any in-progress shape and undoing partial moves. */
+function cancelDrag(): void {
+  const d = drag;
+  if (d && 'moved' in d && d.moved && pendingSnap) page().elements = pendingSnap;
+  drag = null;
+  draft = null;
+  marquee = null;
+  hoverPort = null;
   pendingSnap = null;
+  activePointer = null;
+  syncProps();
+  redraw();
 }
 
 function toPage(e: PointerEvent | MouseEvent): Pt {
@@ -372,6 +389,8 @@ function toPage(e: PointerEvent | MouseEvent): Pt {
 
 ink.addEventListener('pointerdown', (e) => {
   if (!S.hasDoc) return;
+  if (activePointer !== null || drag) return; // ignore a second finger/pen while a gesture is running
+  activePointer = e.pointerId;
   ink.setPointerCapture(e.pointerId);
   if (S.editingId) commitText();
   if (e.button === 1 || spaceDown) {
@@ -448,6 +467,7 @@ ink.addEventListener('pointerdown', (e) => {
 });
 
 ink.addEventListener('pointermove', (e) => {
+  if (drag && e.pointerId !== activePointer) return;
   const raw = toPage(e);
   lastPointer = raw;
   if (!drag) {
@@ -492,7 +512,7 @@ ink.addEventListener('pointermove', (e) => {
       const dy = raw.y - drag.last.y;
       if (!drag.moved && Math.hypot(dx, dy) * S.zoom < 3) return;
       markChanged(drag);
-      for (const el of selectedEls()) moveElement(el, dx, dy);
+      moveElements(page().elements, new Set(S.selection), dx, dy);
       drag.last = raw;
       break;
     }
@@ -538,9 +558,11 @@ function constrain(a: Pt, b: Pt): Pt {
   return { x: a.x + Math.cos(ang) * len, y: a.y + Math.sin(ang) * len };
 }
 
-function finishDrag(): void {
+function finishDrag(e?: PointerEvent): void {
+  if (e && e.pointerId !== activePointer) return;
   const d = drag;
   drag = null;
+  activePointer = null;
   if (!d) return;
   const pg = page();
   if (d.kind === 'draw' && draft) {
@@ -554,11 +576,12 @@ function finishDrag(): void {
     else redraw();
   } else if (d.kind === 'move' || d.kind === 'resize' || d.kind === 'end') {
     hoverPort = null;
-    pendingSnap = null;
-    if (d.moved) {
+    if (d.moved && pendingSnap) {
+      hist().push(pendingSnap);
       pruneLinks(pg.elements);
       afterChange();
     }
+    pendingSnap = null;
     redraw();
   } else if (d.kind === 'marquee' && marquee) {
     const r = rectOf(marquee.a, marquee.b);
@@ -576,8 +599,10 @@ function finishDrag(): void {
     redraw();
   }
 }
-ink.addEventListener('pointerup', finishDrag);
-ink.addEventListener('pointercancel', finishDrag);
+ink.addEventListener('pointerup', (e) => finishDrag(e));
+ink.addEventListener('pointercancel', (e) => {
+  if (e.pointerId === activePointer) cancelDrag();
+});
 ink.addEventListener('pointerleave', () => {
   lastPointer = null;
   if (!drag) {
@@ -710,10 +735,28 @@ function setTool(t: Tool): void {
   say(t === 'symbol' ? 'Click the page to place the symbol.' : '');
 }
 
-function applyStyle(patch: Partial<StyleProps>): void {
+/**
+ * Apply a style change to the defaults and the selection. Slider/colour-picker drags fire many `input`
+ * events; `continuous` folds one whole gesture into a single undo step.
+ */
+let styleGesture = false;
+function applyStyle(patch: Partial<StyleProps>, continuous = false): void {
   Object.assign(S.style, patch);
   const sel = selectedEls();
-  if (sel.length && S.tool === 'select') mutate(() => sel.forEach((e) => Object.assign(e.style, patch)));
+  if (sel.length && S.tool === 'select') {
+    const change = () => sel.forEach((e) => Object.assign(e.style, patch));
+    if (continuous) {
+      if (!styleGesture) {
+        hist().push(cloneElements(page().elements));
+        styleGesture = true;
+      }
+      change();
+      afterChange();
+    } else {
+      styleGesture = false;
+      mutate(change);
+    }
+  }
   syncStyleControls();
 }
 
@@ -726,11 +769,12 @@ function syncStyleControls(): void {
   document.querySelectorAll<HTMLElement>('.swatch').forEach((b) => b.setAttribute('aria-pressed', String(b.title === S.style.stroke)));
 }
 
-$<HTMLInputElement>('st-stroke').addEventListener('input', (e) => applyStyle({ stroke: (e.target as HTMLInputElement).value }));
-$<HTMLInputElement>('st-fill').addEventListener('input', (e) => applyStyle({ fill: (e.target as HTMLInputElement).value }));
+$<HTMLInputElement>('st-stroke').addEventListener('input', (e) => applyStyle({ stroke: (e.target as HTMLInputElement).value }, true));
+$<HTMLInputElement>('st-fill').addEventListener('input', (e) => applyStyle({ fill: (e.target as HTMLInputElement).value }, true));
 $<HTMLSelectElement>('st-fillstyle').addEventListener('change', (e) => applyStyle({ fillStyle: (e.target as HTMLSelectElement).value as FillStyle }));
-$<HTMLInputElement>('st-width').addEventListener('input', (e) => applyStyle({ width: +(e.target as HTMLInputElement).value }));
-$<HTMLInputElement>('st-rough').addEventListener('input', (e) => applyStyle({ roughness: +(e.target as HTMLInputElement).value }));
+$<HTMLInputElement>('st-width').addEventListener('input', (e) => applyStyle({ width: +(e.target as HTMLInputElement).value }, true));
+$<HTMLInputElement>('st-rough').addEventListener('input', (e) => applyStyle({ roughness: +(e.target as HTMLInputElement).value }, true));
+for (const id of ['st-stroke', 'st-fill', 'st-width', 'st-rough']) $(id).addEventListener('change', () => (styleGesture = false));
 $<HTMLSelectElement>('st-route').addEventListener('change', (e) => {
   S.route = (e.target as HTMLSelectElement).value as 'straight' | 'elbow';
   const lines = selectedEls().filter((x): x is LineEl => x.type === 'line' || x.type === 'arrow');
@@ -839,7 +883,7 @@ function syncProps(): void {
       n.min = '16';
       n.max = '400';
       n.value = String(Math.round(e.size));
-      n.addEventListener('change', () => mutate(() => (e.size = Math.max(16, +n.value || e.size))));
+      n.addEventListener('change', () => mutate(() => (e.size = Math.min(400, Math.max(16, +n.value || e.size)))));
       row('Size', n);
       const def = getSymbol(e.symbol);
       const info = document.createElement('span');
@@ -857,7 +901,7 @@ function syncProps(): void {
       n.min = '8';
       n.max = '200';
       n.value = String(e.size);
-      n.addEventListener('change', () => mutate(() => (e.size = Math.max(8, +n.value || e.size))));
+      n.addEventListener('change', () => mutate(() => (e.size = Math.min(200, Math.max(8, +n.value || e.size)))));
       row('Font size', n);
     }
     if (e.type === 'line' || e.type === 'arrow') {
@@ -905,7 +949,7 @@ function rotateSelection(delta: number): void {
 function deleteSelection(): void {
   if (!S.selection.length) return;
   const ids = new Set(S.selection);
-  mutate(() => (page().elements = page().elements.filter((e) => !ids.has(e.id))));
+  mutate(() => (page().elements = removeElements(page().elements, ids)));
   S.selection = [];
   syncProps();
 }
@@ -913,7 +957,7 @@ function deleteSelection(): void {
 function duplicateSelection(): void {
   const sel = selectedEls();
   if (!sel.length) return;
-  const copies = cloneForPaste(sel, 18, 18);
+  const copies = cloneForPaste(sel, 18, 18, page().elements);
   mutate(() => page().elements.push(...copies));
   S.selection = copies.map((c) => c.id);
   syncProps();
@@ -982,6 +1026,34 @@ function hasWork(): boolean {
   return S.doc.pages.some((p) => p.elements.length > 0);
 }
 
+/** Drop every piece of in-flight UI state so nothing from the old document leaks into the new one. */
+function resetTransient(): void {
+  commitText();
+  drag = null;
+  draft = null;
+  marquee = null;
+  hoverPort = null;
+  pendingSnap = null;
+  activePointer = null;
+  styleGesture = false;
+  S.selection = [];
+  S.editingId = null;
+}
+
+/** Single path for replacing the open document (new, open PDF, open project, restore). */
+function installDoc(doc: Doc, pdf: PdfSource | null): void {
+  resetTransient();
+  if (S.pdf && S.pdf !== pdf) S.pdf.destroy();
+  S.pdf = pdf;
+  S.doc = doc;
+  histories = new WeakMap();
+  S.hasDoc = true;
+  S.pageIdx = 0;
+  fitWidth();
+  syncProps();
+  updateButtons();
+}
+
 async function openPdf(file: File | Blob): Promise<void> {
   try {
     if (hasWork() && !confirm('Replace the current document? Unsaved markup will be lost.')) return;
@@ -989,16 +1061,9 @@ async function openPdf(file: File | Blob): Promise<void> {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const src = await PdfSource.load(bytes);
     const pages = await src.pages();
-    S.pdf = src;
-    S.doc = { pages };
-    histories.clear();
-    S.hasDoc = true;
-    S.selection = [];
-    S.pageIdx = 0;
-    fitWidth();
-    updateButtons();
+    installDoc({ pages }, src);
     say(`Opened PDF — ${pages.length} page${pages.length === 1 ? '' : 's'}. Pick a tool and mark it up.`);
-    scheduleAutosave();
+    scheduleAutosave(true);
   } catch (e) {
     say(`Could not open PDF: ${(e as Error).message}`);
   }
@@ -1006,35 +1071,30 @@ async function openPdf(file: File | Blob): Promise<void> {
 
 function newDiagram(): void {
   if (hasWork() && !confirm('Start a new diagram? Unsaved work will be lost.')) return;
-  S.pdf = null;
-  S.doc = { pages: [blankPage()] };
-  histories.clear();
-  S.hasDoc = true;
-  S.selection = [];
-  S.pageIdx = 0;
-  fitWidth();
-  updateButtons();
+  installDoc({ pages: [blankPage()] }, null);
   setTool('select');
   say('Blank diagram ready. Pick a symbol from the palette.');
-  scheduleAutosave();
+  scheduleAutosave(true);
+}
+
+/** Pages that point past the end of the loaded PDF (or have no PDF) become blank pages of the same size. */
+function reconcilePages(doc: Doc, pdf: PdfSource | null): void {
+  doc.pages = doc.pages.map((p) =>
+    p.kind === 'pdf' && (!pdf || p.pdfIndex === undefined || p.pdfIndex >= pdf.numPages) ? { ...p, kind: 'blank' as const, pdfIndex: undefined } : p,
+  );
 }
 
 async function openProject(file: File): Promise<void> {
   try {
     const { doc, pdfBytes } = parseProject(await file.text());
-    S.pdf = pdfBytes ? await PdfSource.load(pdfBytes) : null;
-    if (!S.pdf) doc.pages = doc.pages.map((p) => (p.kind === 'pdf' ? { ...p, kind: 'blank' as const } : p));
-    S.doc = doc;
-    histories.clear();
-    S.hasDoc = true;
-    S.selection = [];
-    S.pageIdx = 0;
-    fitWidth();
-    updateButtons();
+    if (hasWork() && !confirm('Open this project? Unsaved work in the current document will be lost.')) return;
+    const pdf = pdfBytes ? await PdfSource.load(pdfBytes) : null;
+    reconcilePages(doc, pdf);
+    installDoc(doc, pdf);
     say('Project opened.');
-    scheduleAutosave();
+    scheduleAutosave(true);
   } catch (e) {
-    say((e as Error).message);
+    say(`Could not open project: ${(e as Error).message}`);
   }
 }
 
@@ -1075,7 +1135,7 @@ async function exportPdfFile(): Promise<void> {
     download(S.pdf ? 'annotated.pdf' : 'diagram.pdf', bytes as BlobPart, 'application/pdf');
     say('Exported PDF.');
   } catch (e) {
-    say(`PDF export failed: ${(e as Error).message}`);
+    say(e instanceof ExportError ? e.message : `PDF export failed: ${(e as Error).message}`);
   }
 }
 
@@ -1083,11 +1143,11 @@ async function exportPngFile(): Promise<void> {
   try {
     await ready();
     const p = page();
-    const scale = 2;
-    const c = document.createElement('canvas');
+    const scale = overlayScale(p, 2);
+    const c = document.createElement('canvas'); // private canvas: never shared with the on-screen render
     const ctx = c.getContext('2d')!;
     if (p.kind === 'pdf' && S.pdf && p.pdfIndex !== undefined) {
-      await S.pdf.render(p.pdfIndex, c, scale);
+      if (!(await S.pdf.render(p.pdfIndex, c, scale))) throw new Error('page render was interrupted');
     } else {
       c.width = Math.ceil(p.width * scale);
       c.height = Math.ceil(p.height * scale);
@@ -1111,29 +1171,63 @@ function exportSvgFile(): void {
   say(page().kind === 'pdf' ? 'Exported SVG of the markup only (the PDF page itself is not included).' : 'Exported SVG.');
 }
 
+function saveProjectFile(): void {
+  try {
+    download('handsketch-project.handsketch.json', serializeProject(S.doc, S.pdf?.bytes), 'application/json');
+    say('Project saved.');
+  } catch (e) {
+    say(`Could not save project (the PDF may be too large): ${(e as Error).message}`);
+  }
+}
+
 // ---------------------------------------------------------- autosave
+const AUTOSAVE_VERSION = 2;
 let saveTimer = 0;
-function scheduleAutosave(): void {
+/** The PDF bytes are large and rarely change, so they are written to their own key and only when replaced. */
+let savedPdfRef: Uint8Array | null | undefined;
+let autosaveOk = true;
+
+async function flushAutosave(forcePdf = false): Promise<void> {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    if (!S.hasDoc) return;
-    void kvSet('autosave', { doc: JSON.parse(JSON.stringify(S.doc)), pdf: S.pdf?.bytes ?? null, at: Date.now() });
-  }, 700);
+  if (!S.hasDoc) return;
+  const pdfBytes = S.pdf?.bytes ?? null;
+  let ok = true;
+  if (forcePdf || savedPdfRef !== pdfBytes) {
+    ok = (await kvSet('autosave-pdf', pdfBytes)) && ok;
+    if (ok) savedPdfRef = pdfBytes;
+  }
+  ok = (await kvSet('autosave-doc', { v: AUTOSAVE_VERSION, doc: JSON.parse(JSON.stringify(S.doc)), hasPdf: !!pdfBytes, at: Date.now() })) && ok;
+  if (!ok && autosaveOk) say('Autosave failed (browser storage full or blocked). Use “Save project” to keep your work.');
+  autosaveOk = ok;
+}
+
+function scheduleAutosave(forcePdf = false): void {
+  window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => void flushAutosave(forcePdf), 700);
 }
 
 async function restore(): Promise<void> {
-  const saved = await kvGet<{ doc: Doc; pdf: Uint8Array | null }>('autosave');
-  if (!saved || !saved.doc?.pages?.length) return;
+  const saved = await kvGet<{ v: number; doc: unknown; hasPdf: boolean }>('autosave-doc');
+  if (!saved || saved.v !== AUTOSAVE_VERSION) return;
   try {
-    S.pdf = saved.pdf ? await PdfSource.load(saved.pdf) : null;
-    S.doc = saved.doc;
-    S.hasDoc = true;
-    S.pageIdx = 0;
-    fitWidth();
-    updateButtons();
+    validateDoc(saved.doc);
+    const doc = saved.doc as Doc;
+    let pdf: PdfSource | null = null;
+    if (saved.hasPdf) {
+      const bytes = await kvGet<Uint8Array>('autosave-pdf');
+      if (bytes) pdf = await PdfSource.load(bytes);
+    }
+    if (S.hasDoc) {
+      pdf?.destroy(); // the user already started something; don't clobber it
+      return;
+    }
+    reconcilePages(doc, pdf);
+    installDoc(doc, pdf);
+    savedPdfRef = pdf?.bytes ?? null;
     say('Restored your last session.');
   } catch {
-    await kvDelete('autosave');
+    await kvDelete('autosave-doc');
+    await kvDelete('autosave-pdf');
   }
 }
 
@@ -1151,10 +1245,7 @@ $('file-project').addEventListener('change', (e) => {
   if (f) void openProject(f);
   (e.target as HTMLInputElement).value = '';
 });
-$('btn-save').addEventListener('click', () => {
-  download('handsketch-project.handsketch.json', serializeProject(S.doc, S.pdf?.bytes), 'application/json');
-  say('Project saved.');
-});
+$('btn-save').addEventListener('click', saveProjectFile);
 $('btn-undo').addEventListener('click', undo);
 $('btn-redo').addEventListener('click', redo);
 $('zoom-in').addEventListener('click', () => setZoom(S.zoom * 1.2));
@@ -1192,6 +1283,7 @@ window.addEventListener('keydown', (e) => {
   if (t.closest('input, textarea, select, dialog')) return;
   const mod = e.ctrlKey || e.metaKey;
   if (e.key === ' ') {
+    if (t.closest('button, a, summary')) return; // let Space activate focused controls
     spaceDown = true;
     ink.style.cursor = 'grab';
     e.preventDefault();
@@ -1213,12 +1305,12 @@ window.addEventListener('keydown', (e) => {
     syncProps();
     redraw();
   } else if (mod && e.key.toLowerCase() === 'c') {
-    S.clipboard = cloneElements(selectedEls());
+    S.clipboard = cloneForPaste(selectedEls(), 0, 0, page().elements);
   } else if (mod && e.key.toLowerCase() === 'v') {
     if (!S.clipboard.length) return;
     e.preventDefault();
-    const copies = cloneForPaste(S.clipboard, 20, 20);
-    S.clipboard = cloneElements(copies);
+    const copies = cloneForPaste(S.clipboard, 20, 20, S.clipboard);
+    S.clipboard = cloneForPaste(copies, 0, 0, copies);
     mutate(() => page().elements.push(...copies));
     setTool('select');
     S.selection = copies.map((c) => c.id);
@@ -1230,9 +1322,7 @@ window.addEventListener('keydown', (e) => {
       deleteSelection();
     }
   } else if (e.key === 'Escape') {
-    draft = null;
-    drag = null;
-    marquee = null;
+    cancelDrag();
     S.selection = [];
     if (S.tool === 'symbol') setTool('select');
     syncProps();
@@ -1244,13 +1334,17 @@ window.addEventListener('keydown', (e) => {
     const step = e.shiftKey ? 10 : 1;
     const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
     const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
-    mutate(() => selectedEls().forEach((el) => moveElement(el, dx, dy)));
+    mutate(() => moveElements(page().elements, new Set(S.selection), dx, dy));
   } else if (!mod && !e.altKey && KEYS[e.key.toLowerCase()]) {
     setTool(KEYS[e.key.toLowerCase()]);
   }
 });
 // Dropdowns keep focus after a choice, which would swallow tool shortcuts.
 document.querySelectorAll('select').forEach((sel) => sel.addEventListener('change', () => sel.blur()));
+window.addEventListener('blur', () => {
+  spaceDown = false;
+  ink.style.cursor = S.tool === 'select' ? 'default' : 'crosshair';
+});
 window.addEventListener('keyup', (e) => {
   if (e.key === ' ') {
     spaceDown = false;
@@ -1258,6 +1352,10 @@ window.addEventListener('keyup', (e) => {
   }
 });
 window.addEventListener('resize', () => S.hasDoc && layout());
+window.addEventListener('pagehide', () => void flushAutosave());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') void flushAutosave();
+});
 
 // Test/debug hook (read-only access to state).
 declare global {

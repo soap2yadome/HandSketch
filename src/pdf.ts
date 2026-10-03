@@ -32,21 +32,33 @@ export class PdfSource {
     return out;
   }
 
-  private task: pdfjs.RenderTask | null = null;
+  /** One in-flight render per canvas, so an export render never cancels the on-screen one. */
+  private tasks = new WeakMap<HTMLCanvasElement, pdfjs.RenderTask>();
 
-  /** Render a page to a canvas at `scale` css-pixels-per-point (callers include devicePixelRatio). */
-  async render(index: number, canvas: HTMLCanvasElement, scale: number): Promise<void> {
-    this.task?.cancel();
+  /**
+   * Render a page to a canvas at `scale` canvas-pixels-per-point. Resolves true when the page was
+   * fully painted, false when this render was superseded by a newer one on the same canvas.
+   */
+  async render(index: number, canvas: HTMLCanvasElement, scale: number): Promise<boolean> {
+    this.tasks.get(canvas)?.cancel();
     const pg = await this.doc.getPage(index + 1);
     const vp = pg.getViewport({ scale });
     canvas.width = Math.ceil(vp.width);
     canvas.height = Math.ceil(vp.height);
     const task = pg.render({ canvas, viewport: vp });
-    this.task = task;
+    this.tasks.set(canvas, task);
     try {
       await task.promise;
+      return true;
     } catch (e) {
-      if ((e as Error).name !== 'RenderingCancelledException') throw e;
+      if ((e as Error).name === 'RenderingCancelledException') return false;
+      throw e;
+    } finally {
+      if (this.tasks.get(canvas) === task) this.tasks.delete(canvas);
     }
+  }
+
+  destroy(): void {
+    void this.doc.destroy();
   }
 }

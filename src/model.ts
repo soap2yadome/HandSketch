@@ -1,3 +1,4 @@
+import { lineEndpoints } from './render';
 import type { Pt } from './sketch';
 
 export type FillStyle = 'none' | 'hachure' | 'solid';
@@ -121,11 +122,19 @@ export function cloneElements(els: El[]): El[] {
   return JSON.parse(JSON.stringify(els)) as El[];
 }
 
-/** Translate an element in place. Lines drop any port links, since they no longer follow a symbol. */
-export function moveElement(el: El, dx: number, dy: number): void {
+/** Freeze a connector's resolved endpoints into p1/p2 so it keeps its place once links are dropped. */
+export function bakeLine(el: LineEl, els: El[]): void {
+  const [a, b] = lineEndpoints(el, els);
+  el.p1 = a;
+  el.p2 = b;
+}
+
+/** Translate an element in place (connectors keep their current visual position, then lose links). */
+export function moveElement(el: El, dx: number, dy: number, context: El[] = []): void {
   switch (el.type) {
     case 'line':
     case 'arrow':
+      bakeLine(el, context);
       el.p1 = { x: el.p1.x + dx, y: el.p1.y + dy };
       el.p2 = { x: el.p2.x + dx, y: el.p2.y + dy };
       delete el.from;
@@ -138,6 +147,40 @@ export function moveElement(el: El, dx: number, dy: number): void {
       el.x += dx;
       el.y += dy;
   }
+}
+
+/**
+ * Move a selection. A connector whose end is attached to a symbol that moves with it stays attached;
+ * an end attached to something that stays behind is detached and travels with the connector.
+ */
+export function moveElements(all: El[], ids: Set<string>, dx: number, dy: number): void {
+  const targets = all.filter((e) => ids.has(e.id));
+  // Resolve connector ends against the pre-move layout before anything shifts.
+  const resolved = new Map<string, [Pt, Pt]>();
+  for (const e of targets) if (e.type === 'line' || e.type === 'arrow') resolved.set(e.id, lineEndpoints(e, all));
+  for (const e of targets) {
+    if (e.type === 'line' || e.type === 'arrow') {
+      const [a, b] = resolved.get(e.id)!;
+      const keepFrom = !!e.from && ids.has(e.from.id);
+      const keepTo = !!e.to && ids.has(e.to.id);
+      e.p1 = { x: a.x + dx, y: a.y + dy };
+      e.p2 = { x: b.x + dx, y: b.y + dy };
+      if (!keepFrom) delete e.from;
+      if (!keepTo) delete e.to;
+    } else moveElement(e, dx, dy, all);
+  }
+}
+
+/** Delete elements, first freezing any connector ends that were attached to them. */
+export function removeElements(all: El[], ids: Set<string>): El[] {
+  for (const e of all) {
+    if ((e.type === 'line' || e.type === 'arrow') && !ids.has(e.id) && ((e.from && ids.has(e.from.id)) || (e.to && ids.has(e.to.id)))) {
+      bakeLine(e, all);
+      if (e.from && ids.has(e.from.id)) delete e.from;
+      if (e.to && ids.has(e.to.id)) delete e.to;
+    }
+  }
+  return all.filter((e) => !ids.has(e.id));
 }
 
 /** Remove link references to elements that no longer exist. */
@@ -190,38 +233,33 @@ export class History {
 }
 
 /** Deep-copy elements for paste/duplicate: fresh ids and seeds, links kept only inside the set. */
-export function cloneForPaste(els: El[], dx = 0, dy = 0): El[] {
+export function cloneForPaste(els: El[], dx = 0, dy = 0, context: El[] = els): El[] {
   const copies = cloneElements(els);
+  // Freeze connector geometry from the originals so dropped links don't snap back to stale points.
+  copies.forEach((c, i) => {
+    const o = els[i];
+    if ((c.type === 'line' || c.type === 'arrow') && (o.type === 'line' || o.type === 'arrow')) {
+      const [a, b] = lineEndpoints(o, context);
+      c.p1 = a;
+      c.p2 = b;
+    }
+  });
   const map = new Map<string, string>();
   for (const e of copies) {
     const id = newId();
     map.set(e.id, id);
     e.id = id;
+    e.seed = newSeed();
   }
   for (const e of copies) {
     if (e.type === 'line' || e.type === 'arrow') {
-      if (e.from) {
-        const to = map.get(e.from.id);
-        if (to) e.from.id = to;
-        else delete e.from;
-      }
-      if (e.to) {
-        const to = map.get(e.to.id);
-        if (to) e.to.id = to;
-        else delete e.to;
-      }
-    }
-    // Linked line ends follow their symbols; only translate the free data.
-    moveElementKeepLinks(e, dx, dy);
+      const from = e.from && map.get(e.from.id);
+      const to = e.to && map.get(e.to.id);
+      if (e.from) (from ? (e.from.id = from) : delete e.from);
+      if (e.to) (to ? (e.to.id = to) : delete e.to);
+      e.p1 = { x: e.p1.x + dx, y: e.p1.y + dy };
+      e.p2 = { x: e.p2.x + dx, y: e.p2.y + dy };
+    } else moveElement(e, dx, dy);
   }
   return copies;
-}
-
-function moveElementKeepLinks(el: El, dx: number, dy: number): void {
-  if (el.type === 'line' || el.type === 'arrow') {
-    const { from, to } = el;
-    moveElement(el, dx, dy);
-    if (from) el.from = from;
-    if (to) el.to = to;
-  } else moveElement(el, dx, dy);
 }

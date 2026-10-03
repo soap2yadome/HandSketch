@@ -1,6 +1,6 @@
 import { PDFDocument } from 'pdf-lib';
 import { describe, expect, it } from 'vitest';
-import { exportPdf, pageToSvg } from '../src/export';
+import { ExportError, exportPdf, overlayScale, pageToSvg } from '../src/export';
 import { DEFAULT_STYLE, blankPage, type BoxEl, type Doc, type Page } from '../src/model';
 import { make, makeTestPdf, renderPdfPage } from './helpers';
 
@@ -86,6 +86,36 @@ describe('annotated PDF export', () => {
     let dark = 0;
     for (let x = 100; x < 200; x++) for (let y = 100; y < 200; y++) if (r.pixel(x, y)[0] < 120) dark++;
     expect(dark).toBeGreaterThan(200);
+  });
+
+  it('caps raster size on huge pages and keeps full resolution on normal ones', () => {
+    const huge = blankPage(14400, 14400);
+    const px = Math.ceil(huge.width * overlayScale(huge)) * Math.ceil(huge.height * overlayScale(huge));
+    expect(px).toBeLessThanOrEqual(41_000_000);
+    expect(overlayScale(blankPage(612, 792))).toBe(3);
+  });
+
+  it('copies shared page content once when rebuilding (no per-page duplication of the source)', async () => {
+    const bytes = await makeTestPdf();
+    const pages = pdfPages([[300, 200], [200, 300], [300, 200]]);
+    const out = await exportPdf({ doc: { pages: [pages[2], pages[0]] }, pdfBytes: bytes, make });
+    const loaded = await PDFDocument.load(out);
+    expect(loaded.getPageCount()).toBe(2);
+  });
+
+  it('refuses a pdf page with no usable source instead of silently exporting blanks', async () => {
+    const pages = pdfPages([[300, 200]]);
+    await expect(exportPdf({ doc: { pages }, make })).rejects.toBeInstanceOf(ExportError);
+    const bytes = await makeTestPdf();
+    pages[0].pdfIndex = 99;
+    await expect(exportPdf({ doc: { pages }, pdfBytes: bytes, make })).rejects.toThrow(/not available/);
+  });
+
+  it('gives a clear error for encrypted PDFs', async () => {
+    const enc = await PDFDocument.create();
+    enc.addPage([100, 100]);
+    const raw = Buffer.from(await enc.save()).toString('latin1').replace('/Root', '/Encrypt << /Filter /Standard /V 1 /R 2 /O (x) /U (x) /P -4 >> /Root');
+    await expect(exportPdf({ doc: { pages: pdfPages([[100, 100]]) }, pdfBytes: new Uint8Array(Buffer.from(raw, 'latin1')), make })).rejects.toBeInstanceOf(ExportError);
   });
 
   it('produces valid standalone SVG', () => {
