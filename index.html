@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HandSketch — hand-drawn PDF markup &amp; diagrams</title>
+  <meta name="description" content="Mark up PDFs and draw network, electrical and security/access-control diagrams in a hand-drawn style. Runs entirely in your browser." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M5 25 C9 8 14 28 18 14 S25 9 27 7' fill='none' stroke='%231f2a44' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand"><svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><path d="M5 25 C9 8 14 28 18 14 S25 9 27 7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg> HandSketch</div>
+      <div class="group">
+        <button id="btn-open-pdf" title="Open a PDF to mark up">Open PDF</button>
+        <button id="btn-new" title="Start a blank diagram">New diagram</button>
+        <button id="btn-open-project" title="Open a saved .handsketch.json project">Open project</button>
+        <button id="btn-save" title="Save project file (includes the PDF)">Save project</button>
+        <div class="menu">
+          <button id="btn-export" aria-haspopup="true">Export ▾</button>
+          <div class="menu-list" id="export-menu" hidden>
+            <button id="exp-pdf">Annotated PDF (all pages)</button>
+            <button id="exp-png">Current page as PNG</button>
+            <button id="exp-svg">Current page as SVG (diagram only)</button>
+          </div>
+        </div>
+      </div>
+      <div class="group">
+        <button id="btn-undo" title="Undo (Ctrl+Z)">↶</button>
+        <button id="btn-redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+      </div>
+      <div class="group">
+        <button id="zoom-out" title="Zoom out">−</button>
+        <span id="zoom-label" class="zoom-label">100%</span>
+        <button id="zoom-in" title="Zoom in">+</button>
+        <button id="zoom-fit" title="Fit page width">Fit</button>
+      </div>
+      <div class="grow"></div>
+      <button id="btn-help" title="Shortcuts">?</button>
+    </header>
+
+    <aside class="tools" aria-label="Tools">
+      <div id="toolbox" class="toolbox"></div>
+      <div class="style">
+        <label>Ink <input type="color" id="st-stroke" value="#1f2a44" /></label>
+        <div class="swatches" id="swatches"></div>
+        <label>Fill <input type="color" id="st-fill" value="#f2c94c" /></label>
+        <label>Fill style
+          <select id="st-fillstyle"><option value="none">None</option><option value="hachure">Hachure</option><option value="solid">Solid</option></select>
+        </label>
+        <label>Width <input type="range" id="st-width" min="1" max="10" step="0.5" value="2" /></label>
+        <label>Roughness <input type="range" id="st-rough" min="0" max="3" step="0.25" value="1" /></label>
+        <label>Connector
+          <select id="st-route"><option value="straight">Straight</option><option value="elbow">Elbow</option></select>
+        </label>
+        <label id="stamp-row">Stamp
+          <select id="st-stamp"></select>
+        </label>
+        <label class="check"><input type="checkbox" id="st-snap" checked /> Snap to grid</label>
+      </div>
+    </aside>
+
+    <main class="stage" id="stage">
+      <div class="empty-hint" id="empty-hint">Drop a PDF here, or start a blank diagram.</div>
+      <div class="page-wrap" id="page-wrap">
+        <canvas id="pdf-canvas"></canvas>
+        <canvas id="ink-canvas"></canvas>
+      </div>
+    </main>
+
+    <aside class="side" aria-label="Symbols and properties">
+      <section id="props" class="props" hidden>
+        <h3>Selection</h3>
+        <div id="props-body"></div>
+      </section>
+      <section class="symbols">
+        <h3>Symbols</h3>
+        <input type="search" id="sym-search" placeholder="Search symbols…" aria-label="Search symbols" />
+        <div class="chips" id="sym-chips"></div>
+        <div class="sym-grid" id="sym-grid"></div>
+        <p class="hint">Click a symbol, then click the page to place it. Use <kbd>[</kbd> <kbd>]</kbd> to rotate. Draw connectors with the Line tool — ends snap to symbol ports.</p>
+      </section>
+    </aside>
+
+    <footer class="statusbar">
+      <div class="group">
+        <button id="pg-prev" title="Previous page">◀</button>
+        <span id="pg-label">Page 1 / 1</span>
+        <button id="pg-next" title="Next page">▶</button>
+        <button id="pg-add" title="Add a blank page after this one">+ Blank page</button>
+        <button id="pg-del" title="Delete this page">Delete page</button>
+      </div>
+      <span id="status" role="status" aria-live="polite"></span>
+    </footer>
+  </div>
+
+  <dialog id="help">
+    <h2>Shortcuts</h2>
+    <table>
+      <tr><td><kbd>V</kbd> select · <kbd>P</kbd> pen · <kbd>M</kbd> marker · <kbd>L</kbd> line · <kbd>A</kbd> arrow</td></tr>
+      <tr><td><kbd>R</kbd> rectangle · <kbd>O</kbd> ellipse · <kbd>C</kbd> revision cloud · <kbd>H</kbd> highlight box · <kbd>T</kbd> text · <kbd>S</kbd> stamp</td></tr>
+      <tr><td><kbd>[</kbd> / <kbd>]</kbd> rotate symbol · <kbd>Del</kbd> delete · <kbd>Ctrl</kbd>+<kbd>D</kbd> duplicate · <kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>V</kbd> copy/paste</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redo · <kbd>Ctrl</kbd>+scroll zoom · hold <kbd>Space</kbd> and drag to pan</td></tr>
+      <tr><td>Your PDF never leaves the browser. Work autosaves locally.</td></tr>
+    </table>
+    <form method="dialog"><button>Close</button></form>
+  </dialog>
+  <input type="file" id="file-pdf" accept="application/pdf,.pdf" hidden />
+  <input type="file" id="file-project" accept=".json,application/json" hidden />
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
